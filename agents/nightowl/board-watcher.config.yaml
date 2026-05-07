@@ -1,0 +1,39 @@
+# NightOwl board-watcher configuration.
+#
+# Lists every tracker NightOwl polls on each cron tick. Each entry is queried
+# independently; eligible issues are merged and rate-limited globally before
+# dispatch.
+#
+# Synced from the submission repo via scripts/sync-to-vps.sh into:
+#   /root/.openclaw/workspace/nightowl/board-watcher.config.yaml
+
+global:
+  # Maximum number of issues NightOwl will work on simultaneously across ALL
+  # trackers. Per-repo caps in WORKFLOW.md are enforced separately.
+  max_concurrent_runs: 2
+
+  # Where per-issue workspaces live. Cleaned on success, preserved on failure.
+  workspace_root: /root/.openclaw/workspace/nightowl/repos
+
+trackers:
+  # Linear — primary demo tracker. Tickets get the `nightowl` label to opt in.
+  - name: dyslexiaid-linear
+    kind: linear
+    config:
+      team: ISH
+      active_states: [Todo, "In Progress", Backlog]
+      eligibility:
+        require_labels: [nightowl]
+      # Linear tickets aren't repo-bound at the API level. The watcher routes
+      # ISH-* tickets to this repo unless the ticket body specifies otherwise.
+      default_repo: ishangtxl/DyslexiAid
+
+  # GitHub Issues — secondary demo. NightOwl can fix issues filed against
+  # itself. Tickets get the `nightowl` label OR are assigned to the bot.
+  - name: nightowl-self-issues
+    kind: github-issues
+    config:
+      repo: ishangtxl/NightOwl
+      eligibility:
+        require_labels: [nightowl]
+        require_assignee: Ishans-assistant

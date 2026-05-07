@@ -50,9 +50,10 @@ rsync -av \
   --include='TOOLS.md' \
   --include='HEARTBEAT.md' \
   --include='MEMORY.md' \
+  --include='board-watcher.config.yaml' \
   --exclude='*' \
   "$REPO_ROOT/agents/nightowl/" "$SSH_HOST:$REMOTE_WORKSPACE/"
-ssh "$SSH_HOST" "chown -R root:root $REMOTE_WORKSPACE/IDENTITY.md $REMOTE_WORKSPACE/SOUL.md $REMOTE_WORKSPACE/USER.md $REMOTE_WORKSPACE/AGENTS.md $REMOTE_WORKSPACE/TOOLS.md $REMOTE_WORKSPACE/HEARTBEAT.md $REMOTE_WORKSPACE/MEMORY.md 2>/dev/null || true"
+ssh "$SSH_HOST" "chown -R root:root $REMOTE_WORKSPACE/IDENTITY.md $REMOTE_WORKSPACE/SOUL.md $REMOTE_WORKSPACE/USER.md $REMOTE_WORKSPACE/AGENTS.md $REMOTE_WORKSPACE/TOOLS.md $REMOTE_WORKSPACE/HEARTBEAT.md $REMOTE_WORKSPACE/MEMORY.md $REMOTE_WORKSPACE/board-watcher.config.yaml 2>/dev/null || true"
 
 # 2. Sync skills into the per-agent skills dir. --delete IS safe here because
 #    skills/ is owned entirely by this repo.
@@ -61,6 +62,21 @@ ssh "$SSH_HOST" "mkdir -p $REMOTE_WORKSPACE/skills"
 rsync -av --delete \
   "$REPO_ROOT/skills/" "$SSH_HOST:$REMOTE_WORKSPACE/skills/"
 ssh "$SSH_HOST" "chown -R root:root $REMOTE_WORKSPACE/skills 2>/dev/null || true"
+
+# 2b. Sync NightOwl-owned bin scripts (board watcher, adapters). These are
+#     separate from the shared bins — they implement NightOwl-specific logic.
+if [[ -d "$REPO_ROOT/bin" ]]; then
+  echo "==> sync nightowl bin"
+  ssh "$SSH_HOST" "mkdir -p $REMOTE_WORKSPACE/bin/adapters"
+  rsync -av \
+    --include='*/' \
+    --include='nightowl-*' \
+    --include='adapters/*' \
+    --exclude='*' \
+    "$REPO_ROOT/bin/" "$SSH_HOST:$REMOTE_WORKSPACE/bin/"
+  ssh "$SSH_HOST" "chmod +x $REMOTE_WORKSPACE/bin/nightowl-* $REMOTE_WORKSPACE/bin/adapters/* 2>/dev/null || true"
+  ssh "$SSH_HOST" "chown -R root:root $REMOTE_WORKSPACE/bin 2>/dev/null || true"
+fi
 
 # 3. Symlink shared wrappers from the main workspace into NightOwl's bin.
 #    These wrappers live at /root/.openclaw/workspace/bin and are stable.

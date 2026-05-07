@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""
+NightOwl board watcher — invoked on every cron tick.
+
+Reads board-watcher.config.yaml, queries each adapter for eligible issues,
+enforces concurrency cap, and dispatches per-issue runners in the background.
+
+Idempotent: a tick that finds nothing (or a full cap) exits cleanly. Two ticks
+firing in close succession are serialised by a global tick lock so an issue
+can't be claimed twice.
+
+Designed to be invoked from cron with no arguments. Logs to stderr/stdout —
+OpenClaw's cron scheduler captures them.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+import yaml
+
+WS = Path("/root/.openclaw/workspace/nightowl")
+CONFIG_PATH = WS / "board-watcher.config.yaml"
+LOCK_DIR = WS / ".locks"
+LOG_DIR = WS / "logs"
+TICK_LOCK = LOCK_DIR / ".tick.lock"
+
+# Secrets live in the shared workspace .secrets dir (consistent with
+# transcribe-audio and other shared wrappers). Agent-local override is also
+# checked first for cases where an agent needs its own auth.
+SECRETS_CANDIDATES = [
+    WS / ".secrets" / "linear.env",                       # agent-local override
+    Path("/root/.openclaw/workspace/.secrets/linear.env") # shared
+]
+
+
+def load_secrets():
+    """Source key=value lines from the first existing secrets file into os.environ."""
+    for path in SECRETS_CANDIDATES:
+        if not path.exists():
+            continue
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ[k.strip()] = v.strip()
+        return
+
+
+def acquire_tick_lock():
+    """Skip this tick if another tick is already running."""
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    fh = open(TICK_LOCK, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return None
+    fh.write(f"{os.getpid()}\n")
+    fh.flush()
+    return fh
+
+
+def count_active_locks() -> int:
+    """How many issue-level locks are currently held."""
+    return sum(1 for p in LOCK_DIR.glob("*.lock") if p.name != ".tick.lock")
+
+
+def adapter_path(kind: str) -> Path:
+    return WS / "bin" / "adapters" / kind
+
+
+def call_adapter(kind: str, verb: str, payload: dict) -> dict:
+    """Invoke a board adapter via subprocess. Raises on failure."""
+    proc = subprocess.run(
+        [str(adapter_path(kind)), verb],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"adapter {kind} {verb} failed: {proc.stderr.strip()}")
+    return json.loads(proc.stdout) if proc.stdout.strip() else {}
+
+
+def safe_lock_name(tracker_kind: str, key: str) -> str:
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in key)
+    return f"{tracker_kind}-{safe}.lock"
+
+
+def dispatch(issue: dict, tracker: dict, slot_idx: int):
+    """Spawn the per-issue runner in the background."""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    lock_file = LOCK_DIR / safe_lock_name(tracker["kind"], issue["key"])
+    log_file = LOG_DIR / f"{tracker['kind']}-{issue['key']}-{int(time.time())}.log"
+
+    # Acquire the lock BEFORE marking the ticket claimed, so even if marking
+    # fails the watcher won't double-dispatch on the next tick.
+    lock_file.write_text(f"{os.getpid()} {int(time.time())}\n")
+
+    # Mark ticket claimed via adapter — best effort. If this fails (e.g.
+    # tracker outage), runner will still proceed; lock file prevents
+    # double-dispatch from a future tick.
+    try:
+        call_adapter(tracker["kind"], "transition", {
+            "config": tracker["config"],
+            "id": issue["id"],
+            "to": "claimed",
+        })
+    except Exception as e:
+        sys.stderr.write(f"  [{issue['key']}] claim transition failed: {e} — proceeding anyway\n")
+
+    runner_input = json.dumps({
+        "issue": issue,
+        "tracker_kind": tracker["kind"],
+        "tracker_name": tracker["name"],
+        "tracker_config": tracker["config"],
+        "lock_file": str(lock_file),
+    })
+
+    runner_path = WS / "bin" / "nightowl-issue-runner"
+    log_fh = open(log_file, "w")
+    subprocess.Popen(
+        [str(runner_path)],
+        stdin=subprocess.PIPE,
+        stdout=log_fh,
+        stderr=log_fh,
+        start_new_session=True,
+    ).communicate(runner_input.encode())
+
+    # Note: we don't wait. Runner is responsible for cleaning up its own lock.
+    sys.stderr.write(f"  [{issue['key']}] dispatched (log: {log_file})\n")
+
+
+def main() -> int:
+    dry_run = "--dry-run" in sys.argv
+
+    load_secrets()
+    LOCK_DIR.mkdir(parents=True, exist_ok=True)
+
+    tick_fh = acquire_tick_lock()
+    if tick_fh is None:
+        sys.stderr.write("another tick in progress, skipping\n")
+        return 0
+
+    try:
+        if not CONFIG_PATH.exists():
+            sys.stderr.write(f"config not found: {CONFIG_PATH}\n")
+            return 1
+        cfg = yaml.safe_load(CONFIG_PATH.read_text())
+        global_cap = cfg.get("global", {}).get("max_concurrent_runs", 2)
+
+        running = count_active_locks()
+        slots = global_cap - running
+        if slots <= 0:
+            sys.stderr.write(f"global cap reached ({running}/{global_cap}), skipping\n")
+            return 0
+
+        sys.stderr.write(f"slots available: {slots}/{global_cap}\n")
+        if dry_run:
+            sys.stderr.write("** DRY RUN ** — no claims, no dispatch.\n")
+
+        for tracker in cfg.get("trackers", []):
+            if slots <= 0:
+                break
+            kind = tracker["kind"]
+            if not adapter_path(kind).exists():
+                sys.stderr.write(f"[tracker {tracker['name']}] adapter missing: {kind}\n")
+                continue
+            try:
+                resp = call_adapter(kind, "list", {"config": tracker["config"]})
+            except Exception as e:
+                sys.stderr.write(f"[tracker {tracker['name']}] list failed: {e}\n")
+                continue
+
+            issues = resp.get("issues", [])
+            sys.stderr.write(f"[tracker {tracker['name']}] {len(issues)} eligible\n")
+
+            for issue in issues:
+                if slots <= 0:
+                    break
+                lock = LOCK_DIR / safe_lock_name(kind, issue["key"])
+                if lock.exists():
+                    sys.stderr.write(f"  [{issue['key']}] already locked, skipping\n")
+                    continue
+                if dry_run:
+                    sys.stderr.write(f"  [{issue['key']}] WOULD dispatch — title: {issue['title'][:60]}\n")
+                    slots -= 1
+                    continue
+                try:
+                    dispatch(issue, tracker, slots)
+                    slots -= 1
+                except Exception as e:
+                    sys.stderr.write(f"  [{issue['key']}] dispatch failed: {e}\n")
+
+        return 0
+    finally:
+        try:
+            tick_fh.close()
+            TICK_LOCK.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())

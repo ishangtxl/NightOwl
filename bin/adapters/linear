@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""
+NightOwl BoardAdapter — Linear.
+
+Same protocol as the GitHub Issues adapter: subcommand on argv, JSON config on
+stdin, JSON response on stdout. Uses Linear's GraphQL API directly (no SDK)
+so dependencies stay at zero — only the standard library.
+
+Auth: reads `LINEAR_API_KEY` from env (sourced from the agent's secrets file
+before invocation). Personal API keys are sent as a raw `Authorization: <key>`
+header — no "Bearer" prefix.
+
+Subcommands:
+  list        List eligible issues for a team.
+  get         Fetch one issue by identifier (e.g. "ISH-12") or id.
+  comment     Post a comment on an issue.
+  transition  Set NightOwl lifecycle state via labels.
+
+Stdin shape:
+  list:        {"config": {"team": "ISH", "active_states": [...], "eligibility": {...}}}
+  get:         {"config": {...}, "id": "ISH-12"}
+  comment:     {"config": {...}, "id": "ISH-12", "body": "..."}
+  transition:  {"config": {...}, "id": "ISH-12", "to": "claimed|done|failed|waiting|release"}
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+from typing import Any
+
+LIFECYCLE_LABELS = {
+    "claimed": "nightowl:claimed",
+    "done":    "nightowl:done",
+    "failed":  "nightowl:failed",
+    "waiting": "nightowl:waiting",
+}
+ALL_LIFECYCLE_LABEL_VALUES = set(LIFECYCLE_LABELS.values())
+
+DEFAULT_ACTIVE_STATES = ["Todo", "In Progress"]
+LINEAR_ENDPOINT = os.environ.get("LINEAR_API_ENDPOINT", "https://api.linear.app/graphql")
+
+
+def linear(query: str, variables: dict | None = None) -> dict:
+    """Execute a Linear GraphQL request and return `data`. Raises on errors."""
+    api_key = os.environ.get("LINEAR_API_KEY")
+    if not api_key:
+        raise RuntimeError("LINEAR_API_KEY not set in environment")
+
+    body = json.dumps({"query": query, "variables": variables or {}}).encode()
+    req = urllib.request.Request(
+        LINEAR_ENDPOINT,
+        data=body,
+        headers={
+            "Authorization": api_key,
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Linear HTTP {e.code}: {e.read().decode()[:300]}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Linear unreachable: {e}")
+
+    if payload.get("errors"):
+        raise RuntimeError(f"Linear errors: {payload['errors']}")
+    return payload["data"]
+
+
+# ----- queries -----
+
+QUERY_LIST = """
+query ListIssues($teamKey: String!, $stateNames: [String!]!) {
+  issues(
+    filter: {
+      team: { key: { eq: $teamKey } }
+      state: { name: { in: $stateNames } }
+    }
+    first: 50
+  ) {
+    nodes {
+      id
+      identifier
+      title
+      description
+      url
+      state { name }
+      labels { nodes { id name } }
+      assignee { id email name }
+      branchName
+      priority
+      createdAt
+    }
+  }
+}
+"""
+
+QUERY_GET = """
+query GetIssue($id: String!) {
+  issue(id: $id) {
+    id
+    identifier
+    title
+    description
+    url
+    state { name }
+    labels { nodes { id name } }
+    assignee { id email name }
+    branchName
+    priority
+    createdAt
+  }
+}
+"""
+
+QUERY_TEAM_LABELS = """
+query TeamLabels($teamKey: String!) {
+  team(id: $teamKey) {
+    id
+    labels { nodes { id name } }
+  }
+}
+"""
+
+# Linear's `team(id:)` query is permissive — accepts both UUID id and key.
+# Confirmed via the API docs.
+
+MUT_COMMENT_CREATE = """
+mutation CommentCreate($input: CommentCreateInput!) {
+  commentCreate(input: $input) { success }
+}
+"""
+
+MUT_LABEL_CREATE = """
+mutation LabelCreate($input: IssueLabelCreateInput!) {
+  issueLabelCreate(input: $input) {
+    success
+    issueLabel { id name }
+  }
+}
+"""
+
+MUT_ISSUE_UPDATE = """
+mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
+  issueUpdate(id: $id, input: $input) { success }
+}
+"""
+
+
+# ----- helpers -----
+
+def normalize_issue(raw: dict, team_key: str) -> dict:
+    labels_raw = (raw.get("labels") or {}).get("nodes") or []
+    labels = [l["name"] for l in labels_raw]
+    assignee = raw.get("assignee") or {}
+    assignees = [assignee.get("email")] if assignee.get("email") else []
+    claimed = LIFECYCLE_LABELS["claimed"] in labels
+    return {
+        "id": raw["id"],                # opaque UUID, used for API ops
+        "tracker": "linear",
+        "key": raw["identifier"],       # human-readable "ISH-12"
+        "title": raw.get("title") or "",
+        "body": raw.get("description") or "",
+        "url": raw.get("url") or "",
+        "state": (raw.get("state") or {}).get("name") or "",
+        "labels": labels,
+        "assignees": assignees,
+        # Linear doesn't bind a ticket to a repo at the API level — the bound
+        # repo comes from the WORKFLOW.md `default_repo`. Adapter just leaves
+        # it null and the watcher fills it in.
+        "repo": None,
+        "claimed": claimed,
+        "branch_hint": raw.get("branchName"),
+    }
+
+
+def is_eligible(issue: dict, eligibility: dict) -> bool:
+    blocking = ALL_LIFECYCLE_LABEL_VALUES
+    if any(l in blocking for l in issue["labels"]):
+        return False
+
+    require_labels = eligibility.get("require_labels") or []
+    if not require_labels:
+        # Linear's API key is a personal key; without label discipline the
+        # adapter would pick up the user's entire backlog. Refuse to.
+        return False
+    return any(l in issue["labels"] for l in require_labels)
+
+
+def resolve_team_label_id(team_key: str, label_name: str, create_if_missing: bool) -> str | None:
+    data = linear(QUERY_TEAM_LABELS, {"teamKey": team_key})
+    team = data.get("team") or {}
+    team_id = team.get("id")
+    for node in (team.get("labels") or {}).get("nodes") or []:
+        if node["name"] == label_name:
+            return node["id"]
+    if not create_if_missing:
+        return None
+    if not team_id:
+        raise RuntimeError(f"Team {team_key} not found")
+    created = linear(MUT_LABEL_CREATE, {"input": {
+        "teamId": team_id,
+        "name": label_name,
+        "color": "#5319e7",
+    }})
+    return created["issueLabelCreate"]["issueLabel"]["id"]
+
+
+def resolve_issue_id(identifier_or_id: str, team_key: str) -> str:
+    """Accept either a UUID or a human key like ISH-12."""
+    if "-" in identifier_or_id and not identifier_or_id.count("-") > 1:
+        # Looks like a human identifier — search for it.
+        data = linear(
+            """
+            query($teamKey: String!, $id: String!) {
+              issues(filter: {team: {key: {eq: $teamKey}}, number: {eq: %s}}) {
+                nodes { id identifier }
+              }
+            }
+            """ % identifier_or_id.split("-")[1],
+            {"teamKey": team_key, "id": identifier_or_id},
+        )
+        nodes = data["issues"]["nodes"]
+        if not nodes:
+            raise RuntimeError(f"Linear issue {identifier_or_id} not found in team {team_key}")
+        return nodes[0]["id"]
+    return identifier_or_id
+
+
+# ----- handlers -----
+
+def cmd_list(payload: dict) -> dict:
+    cfg = payload["config"]
+    team_key = cfg["team"]
+    active_states = cfg.get("active_states") or DEFAULT_ACTIVE_STATES
+    eligibility = cfg.get("eligibility") or {}
+
+    data = linear(QUERY_LIST, {"teamKey": team_key, "stateNames": active_states})
+    nodes = data["issues"]["nodes"]
+    issues = [normalize_issue(n, team_key) for n in nodes]
+    eligible = [i for i in issues if is_eligible(i, eligibility)]
+    eligible.sort(key=lambda i: i["key"])
+    return {"issues": eligible}
+
+
+def cmd_get(payload: dict) -> dict:
+    cfg = payload["config"]
+    team_key = cfg["team"]
+    issue_id = resolve_issue_id(str(payload["id"]), team_key)
+    data = linear(QUERY_GET, {"id": issue_id})
+    raw = data.get("issue")
+    if not raw:
+        raise RuntimeError(f"Issue {payload['id']} not found")
+    return {"issue": normalize_issue(raw, team_key)}
+
+
+def cmd_comment(payload: dict) -> dict:
+    cfg = payload["config"]
+    team_key = cfg["team"]
+    issue_id = resolve_issue_id(str(payload["id"]), team_key)
+    body = payload["body"]
+    data = linear(MUT_COMMENT_CREATE, {"input": {"issueId": issue_id, "body": body}})
+    return {"ok": bool(data["commentCreate"]["success"])}
+
+
+def cmd_transition(payload: dict) -> dict:
+    cfg = payload["config"]
+    team_key = cfg["team"]
+    issue_id = resolve_issue_id(str(payload["id"]), team_key)
+    target = payload["to"]
+
+    # Fetch current labels on the issue + all team lifecycle label ids in one go.
+    data = linear(QUERY_GET, {"id": issue_id})
+    raw = data["issue"]
+    current_label_ids = [l["id"] for l in (raw.get("labels") or {}).get("nodes") or []
+                         if l["name"] in ALL_LIFECYCLE_LABEL_VALUES]
+
+    if target == "release":
+        if current_label_ids:
+            linear(MUT_ISSUE_UPDATE, {
+                "id": issue_id,
+                "input": {"labelIds": [l["id"] for l in (raw.get("labels") or {}).get("nodes") or []
+                                       if l["name"] not in ALL_LIFECYCLE_LABEL_VALUES]},
+            })
+        return {"ok": True}
+
+    if target not in LIFECYCLE_LABELS:
+        raise ValueError(f"Unknown transition target: {target}")
+
+    desired_label_id = resolve_team_label_id(team_key, LIFECYCLE_LABELS[target], create_if_missing=True)
+
+    # Strategy: send a full new labelIds list = (current non-lifecycle) + (desired lifecycle).
+    keep = [l["id"] for l in (raw.get("labels") or {}).get("nodes") or []
+            if l["name"] not in ALL_LIFECYCLE_LABEL_VALUES]
+    new_label_ids = list({*keep, desired_label_id})
+    linear(MUT_ISSUE_UPDATE, {"id": issue_id, "input": {"labelIds": new_label_ids}})
+    return {"ok": True}
+
+
+HANDLERS = {
+    "list": cmd_list,
+    "get": cmd_get,
+    "comment": cmd_comment,
+    "transition": cmd_transition,
+}
+
+
+def main() -> int:
+    if len(sys.argv) != 2 or sys.argv[1] not in HANDLERS:
+        sys.stderr.write("usage: linear <list|get|comment|transition>\n")
+        return 2
+
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"bad stdin JSON: {e}\n")
+        return 2
+
+    try:
+        result = HANDLERS[sys.argv[1]](payload)
+    except (KeyError, ValueError) as e:
+        sys.stderr.write(f"input error: {e}\n")
+        return 2
+    except RuntimeError as e:
+        sys.stderr.write(f"upstream error: {e}\n")
+        return 3
+
+    json.dump(result, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

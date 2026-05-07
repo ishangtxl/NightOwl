@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""
+NightOwl BoardAdapter — GitHub Issues.
+
+Speaks the BoardAdapter protocol: subcommand on argv, JSON config on stdin,
+JSON response on stdout. All GitHub access goes through the `gh` CLI so the
+bot account's existing device-flow auth is reused (no PAT required).
+
+Subcommands:
+  list        List eligible issues for a repo.
+  get         Fetch one issue by number.
+  comment     Post a comment on an issue.
+  transition  Move an issue to a NightOwl lifecycle state via labels.
+
+Stdin shape:
+  list:        {"config": {"repo": "owner/name", "eligibility": {...}}}
+  get:         {"config": {...}, "id": "<number>"}
+  comment:     {"config": {...}, "id": "<number>", "body": "..."}
+  transition:  {"config": {...}, "id": "<number>", "to": "claimed|done|failed|waiting|release"}
+
+Exit codes:
+  0  success — JSON written to stdout
+  2  bad input
+  3  upstream (gh) error
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from typing import Any
+
+LIFECYCLE_LABELS = {
+    "claimed": "nightowl:claimed",
+    "done":    "nightowl:done",
+    "failed":  "nightowl:failed",
+    "waiting": "nightowl:waiting",
+}
+ALL_LIFECYCLE_LABEL_VALUES = set(LIFECYCLE_LABELS.values())
+
+
+def gh_json(args: list[str]) -> Any:
+    """Run `gh` with --json flags already in args; return parsed JSON or raise."""
+    proc = subprocess.run(
+        ["gh", *args],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        raise RuntimeError(f"gh failed: {' '.join(args)}")
+    return json.loads(proc.stdout) if proc.stdout.strip() else None
+
+
+def gh_run(args: list[str]) -> None:
+    """Run `gh` for side effects only."""
+    proc = subprocess.run(["gh", *args], capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        raise RuntimeError(f"gh failed: {' '.join(args)}")
+
+
+def normalize_issue(repo: str, raw: dict) -> dict:
+    """Convert gh's issue payload into the BoardAdapter Issue shape."""
+    labels = [l["name"] for l in raw.get("labels", []) or []]
+    assignees = [a["login"] for a in raw.get("assignees", []) or []]
+    claimed = LIFECYCLE_LABELS["claimed"] in labels
+    return {
+        "id": str(raw["number"]),
+        "tracker": "github",
+        "key": f"{repo}#{raw['number']}",
+        "title": raw.get("title", "") or "",
+        "body": raw.get("body", "") or "",
+        "url": raw.get("url", "") or "",
+        "state": raw.get("state", "OPEN"),
+        "labels": labels,
+        "assignees": assignees,
+        "repo": repo,
+        "claimed": claimed,
+        "branch_hint": None,
+    }
+
+
+def is_eligible(issue: dict, eligibility: dict) -> bool:
+    """Apply WORKFLOW.md eligibility rules to a normalized Issue."""
+    # Skip anything already in a NightOwl lifecycle that excludes pickup.
+    blocking = {"nightowl:claimed", "nightowl:done", "nightowl:failed", "nightowl:waiting"}
+    if any(l in blocking for l in issue["labels"]):
+        return False
+
+    require_labels = eligibility.get("require_labels") or []
+    require_assignee = eligibility.get("require_assignee")
+
+    has_required_label = any(l in issue["labels"] for l in require_labels) if require_labels else False
+    has_required_assignee = (require_assignee in issue["assignees"]) if require_assignee else False
+
+    # Default: assignee OR label opens eligibility. If neither configured, nothing
+    # is eligible (prevents accidental org-wide takeover).
+    if not require_labels and not require_assignee:
+        return False
+
+    return has_required_label or has_required_assignee
+
+
+def cmd_list(payload: dict) -> dict:
+    cfg = payload["config"]
+    repo = cfg["repo"]
+    eligibility = cfg.get("eligibility", {}) or {}
+
+    raw = gh_json([
+        "issue", "list",
+        "--repo", repo,
+        "--state", "open",
+        "--limit", "50",
+        "--json", "number,title,body,url,labels,assignees,state",
+    ]) or []
+
+    issues = [normalize_issue(repo, r) for r in raw]
+    eligible = [i for i in issues if is_eligible(i, eligibility)]
+    # Highest-priority surrogate: numerical issue # ascending (oldest first).
+    eligible.sort(key=lambda i: int(i["id"]))
+    return {"issues": eligible}
+
+
+def cmd_get(payload: dict) -> dict:
+    cfg = payload["config"]
+    repo = cfg["repo"]
+    issue_id = str(payload["id"])
+
+    raw = gh_json([
+        "issue", "view", issue_id,
+        "--repo", repo,
+        "--json", "number,title,body,url,labels,assignees,state",
+    ])
+    return {"issue": normalize_issue(repo, raw)}
+
+
+def cmd_comment(payload: dict) -> dict:
+    cfg = payload["config"]
+    repo = cfg["repo"]
+    issue_id = str(payload["id"])
+    body = payload["body"]
+    gh_run(["issue", "comment", issue_id, "--repo", repo, "--body", body])
+    return {"ok": True}
+
+
+def cmd_transition(payload: dict) -> dict:
+    cfg = payload["config"]
+    repo = cfg["repo"]
+    issue_id = str(payload["id"])
+    target = payload["to"]
+
+    if target == "release":
+        # Remove all NightOwl lifecycle labels, leave the rest alone.
+        for label in ALL_LIFECYCLE_LABEL_VALUES:
+            try:
+                gh_run(["issue", "edit", issue_id, "--repo", repo, "--remove-label", label])
+            except RuntimeError:
+                # gh errors when removing a label that isn't present — fine.
+                pass
+        return {"ok": True}
+
+    if target not in LIFECYCLE_LABELS:
+        raise ValueError(f"Unknown transition target: {target}")
+
+    desired_label = LIFECYCLE_LABELS[target]
+    # Remove competing lifecycle labels, add the desired one. Order matters:
+    # remove first, add second, so the issue is never in two states at once.
+    for label in ALL_LIFECYCLE_LABEL_VALUES:
+        if label == desired_label:
+            continue
+        try:
+            gh_run(["issue", "edit", issue_id, "--repo", repo, "--remove-label", label])
+        except RuntimeError:
+            pass
+    # `gh issue edit --add-label` will create the label if it doesn't exist on
+    # the repo only if the user invoking has permission; most repos won't have
+    # the `nightowl:claimed` label by default, so fall back to creating it.
+    try:
+        gh_run(["issue", "edit", issue_id, "--repo", repo, "--add-label", desired_label])
+    except RuntimeError:
+        gh_run(["label", "create", desired_label, "--repo", repo, "--color", "5319e7", "--description", "NightOwl lifecycle"])
+        gh_run(["issue", "edit", issue_id, "--repo", repo, "--add-label", desired_label])
+    return {"ok": True}
+
+
+HANDLERS = {
+    "list": cmd_list,
+    "get": cmd_get,
+    "comment": cmd_comment,
+    "transition": cmd_transition,
+}
+
+
+def main() -> int:
+    if len(sys.argv) != 2 or sys.argv[1] not in HANDLERS:
+        sys.stderr.write("usage: github-issues <list|get|comment|transition>\n")
+        return 2
+
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError as e:
+        sys.stderr.write(f"bad stdin JSON: {e}\n")
+        return 2
+
+    handler = HANDLERS[sys.argv[1]]
+    try:
+        result = handler(payload)
+    except (KeyError, ValueError) as e:
+        sys.stderr.write(f"input error: {e}\n")
+        return 2
+    except RuntimeError as e:
+        sys.stderr.write(f"upstream error: {e}\n")
+        return 3
+
+    json.dump(result, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

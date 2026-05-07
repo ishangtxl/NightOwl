@@ -189,3 +189,100 @@ For a full restart of OpenClaw on the VPS (rare):
 ```bash
 ssh nightowl-vps 'openclaw daemon restart'
 ```
+
+## (Optional) Enable the board watcher
+
+The Telegram flow above is enough for the MVP. To also let NightOwl pick up tickets from Linear or GitHub Issues autonomously, set up the board watcher.
+
+### 1. Configure trackers
+
+Edit `agents/nightowl/board-watcher.config.yaml` in this repo to list every tracker NightOwl should poll. The committed example wires both a Linear team and a GitHub Issues repo. Adjust to your team key and repo, then re-sync:
+
+```bash
+./scripts/sync-to-vps.sh
+```
+
+### 2. Add Linear API key (if using Linear)
+
+```bash
+ssh nightowl-vps "mkdir -p /root/.openclaw/workspace/.secrets && \
+  cat > /root/.openclaw/workspace/.secrets/linear.env <<EOF
+LINEAR_API_KEY=<your-linear-personal-api-key>
+LINEAR_API_ENDPOINT=https://api.linear.app/graphql
+EOF
+chmod 600 /root/.openclaw/workspace/.secrets/linear.env"
+```
+
+Get a key at https://linear.app/settings/api. The watcher uses it for both reads and writes (listing tickets, posting comments, transitioning labels).
+
+### 3. Add a `WORKFLOW.md` to each target repo
+
+Each repo NightOwl operates on needs a `WORKFLOW.md` at its root. Copy [`examples/WORKFLOW.md`](../examples/WORKFLOW.md) and tune the install / test / lint / build commands for your stack. See [`docs/workflow-md.md`](workflow-md.md) for the full schema.
+
+### 4. Verify before scheduling
+
+```bash
+ssh nightowl-vps '/root/.openclaw/workspace/nightowl/bin/nightowl-board-watcher --dry-run'
+```
+
+You should see a list of eligible tickets per tracker. Nothing dispatches in `--dry-run`.
+
+### 5. Install the systemd timer
+
+```bash
+ssh nightowl-vps "cat > /etc/systemd/system/nightowl-board-watcher.service <<EOF
+[Unit]
+Description=NightOwl board watcher tick
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/root/.openclaw/workspace/nightowl/bin/nightowl-board-watcher
+StandardOutput=append:/var/log/nightowl-watcher.log
+StandardError=append:/var/log/nightowl-watcher.log
+TimeoutStartSec=120
+EOF
+cat > /etc/systemd/system/nightowl-board-watcher.timer <<EOF
+[Unit]
+Description=NightOwl board watcher every 30s
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now nightowl-board-watcher.timer"
+```
+
+Verify it's ticking:
+
+```bash
+ssh nightowl-vps 'systemctl list-timers nightowl-board-watcher.timer --no-pager'
+ssh nightowl-vps 'tail -f /var/log/nightowl-watcher.log'
+```
+
+### Operational handles
+
+```bash
+# Status
+systemctl status nightowl-board-watcher.timer
+
+# Pause (no autonomous activity until resumed)
+systemctl stop nightowl-board-watcher.timer
+
+# Resume
+systemctl start nightowl-board-watcher.timer
+
+# One-shot manual run
+/root/.openclaw/workspace/nightowl/bin/nightowl-board-watcher
+```
+
+### Driving it
+
+Once the timer is running, drag any Linear ticket into Todo (or any state in `active_states`), add the `nightowl` label, and the next 30-second tick picks it up. Track progress in the ticket's comment thread. The PR appears in the configured target repo with `Closes <ticket-key>` so Linear's GitHub integration auto-links.

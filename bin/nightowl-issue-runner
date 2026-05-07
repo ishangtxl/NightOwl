@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""
+NightOwl per-issue runner.
+
+Spawned by nightowl-board-watcher for each claimed ticket. Runs in the
+background; stdout/stderr are captured to a log file by the watcher.
+
+Reads a JSON payload from stdin describing the issue + tracker context, then:
+
+  1. Resolves target repo (issue.repo OR tracker.config.default_repo)
+  2. Creates a per-issue workspace + fresh clone
+  3. Reads WORKFLOW.md from the repo (if present)
+  4. Branches: <key-lowercase>-<slug>
+  5. Posts an "implementing" comment to the ticket
+  6. Builds the agent prompt from WORKFLOW.md template + ticket body
+  7. Shells out to claude-code-opus45 to make the change
+  8. Runs install/test/lint/build hooks from WORKFLOW.md (when present)
+  9. Commits, pushes, opens a PR with `Closes <ticket-key>`
+ 10. Posts the final status comment + transitions ticket to done
+ 11. Releases its lock
+
+Any failure: post error comment, transition to `failed`, release lock,
+preserve workspace for inspection.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import shutil
+from pathlib import Path
+
+import yaml
+
+WS = Path("/root/.openclaw/workspace/nightowl")
+ADAPTERS = WS / "bin" / "adapters"
+CLAUDE = "/root/.openclaw/workspace/bin/claude-code-opus45"
+
+DEFAULT_HARD_TIMEOUT_S = 15 * 60
+
+
+# ----- helpers -----
+
+def call_adapter(kind: str, verb: str, payload: dict, timeout: int = 30) -> dict:
+    proc = subprocess.run(
+        [str(ADAPTERS / kind), verb],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"adapter {kind} {verb}: {proc.stderr.strip()[:300]}")
+    return json.loads(proc.stdout) if proc.stdout.strip() else {}
+
+
+def slugify(text: str, max_len: int = 50) -> str:
+    s = text.lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = s.strip("-")
+    return s[:max_len].rstrip("-") or "task"
+
+
+def parse_workflow_md(path: Path) -> tuple[str, dict]:
+    """Returns (prompt_template, config_dict). Both empty if no file."""
+    if not path.exists():
+        return "", {}
+    text = path.read_text()
+    if text.startswith("---"):
+        parts = text.split("---", 2)
+        if len(parts) >= 3:
+            try:
+                cfg = yaml.safe_load(parts[1]) or {}
+            except yaml.YAMLError:
+                cfg = {}
+            body = parts[2].strip()
+            return body, cfg
+    return text.strip(), {}
+
+
+def run(cmd, cwd: Path | None = None, timeout: int = 600, check: bool = True, env: dict | None = None) -> subprocess.CompletedProcess:
+    """Run a shell command. Returns CompletedProcess; raises on check + non-zero."""
+    print(f"$ {' '.join(cmd) if isinstance(cmd, list) else cmd}", flush=True)
+    proc = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        shell=isinstance(cmd, str),
+        env={**os.environ, **(env or {})} if env else None,
+    )
+    if proc.stdout:
+        print(proc.stdout, flush=True)
+    if proc.stderr:
+        print(proc.stderr, file=sys.stderr, flush=True)
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"command failed (rc={proc.returncode}): {cmd}")
+    return proc
+
+
+# ----- main flow -----
+
+def main() -> int:
+    payload = json.loads(sys.stdin.read())
+    issue = payload["issue"]
+    tracker_kind = payload["tracker_kind"]
+    tracker_config = payload["tracker_config"]
+    lock_file = Path(payload["lock_file"])
+
+    issue_id = issue["id"]
+    issue_key = issue["key"]
+    print(f"=== runner started for {issue_key} ===", flush=True)
+
+    def comment(body: str):
+        try:
+            call_adapter(tracker_kind, "comment", {
+                "config": tracker_config,
+                "id": issue_id,
+                "body": body,
+            })
+        except Exception as e:
+            print(f"comment failed: {e}", file=sys.stderr, flush=True)
+
+    def transition(to: str):
+        try:
+            call_adapter(tracker_kind, "transition", {
+                "config": tracker_config,
+                "id": issue_id,
+                "to": to,
+            })
+        except Exception as e:
+            print(f"transition {to} failed: {e}", file=sys.stderr, flush=True)
+
+    def cleanup():
+        try:
+            lock_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    try:
+        # 1. Resolve target repo
+        repo = issue.get("repo") or tracker_config.get("default_repo")
+        if not repo:
+            comment("🦉 ❌ Failed: no repo configured for this ticket. Set `default_repo` in board-watcher.config.yaml or specify in ticket body.")
+            transition("failed")
+            cleanup()
+            return 1
+
+        # 2. Per-issue workspace
+        safe_key = re.sub(r"[^a-zA-Z0-9._-]", "_", issue_key)
+        ws_dir = WS / "repos" / f"{tracker_kind}-{safe_key}"
+        if ws_dir.exists():
+            shutil.rmtree(ws_dir)
+        ws_dir.parent.mkdir(parents=True, exist_ok=True)
+
+        # 3. Clone
+        run(["gh", "repo", "clone", repo, str(ws_dir)], timeout=120)
+
+        # 4. WORKFLOW.md
+        workflow_prompt, workflow_cfg = parse_workflow_md(ws_dir / "WORKFLOW.md")
+        repo_cfg = workflow_cfg.get("repo", {}) or {}
+        agent_cfg = workflow_cfg.get("agent", {}) or {}
+        pr_cfg = workflow_cfg.get("pr", {}) or {}
+        hard_timeout = int(agent_cfg.get("hard_timeout_minutes", DEFAULT_HARD_TIMEOUT_S // 60)) * 60
+
+        # 5. Branch name — prefer Linear's auto-generated, else derive
+        if issue.get("branch_hint"):
+            # Linear gives us "username/ish-5-foo". Strip the user prefix so the
+            # branch name auto-links via Linear's GitHub integration.
+            hint = issue["branch_hint"]
+            branch = hint.split("/", 1)[1] if "/" in hint else hint
+        else:
+            branch = f"{issue_key.lower().replace('#', '')}-{slugify(issue['title'])}"
+        branch = re.sub(r"[^a-zA-Z0-9._/-]", "-", branch)[:80].rstrip("-/")
+
+        # If branch already exists on remote, append timestamp to avoid conflict
+        existing = subprocess.run(
+            ["git", "ls-remote", "--heads", "origin", branch],
+            cwd=str(ws_dir), capture_output=True, text=True,
+        )
+        if existing.stdout.strip():
+            branch = f"{branch}-{int(time.time())}"
+
+        run(["git", "checkout", "-b", branch], cwd=ws_dir)
+
+        # 6. Implementing comment
+        comment(f"🦉 Implementing on branch `{branch}` — ETA ~2-4 min.")
+
+        # 7. install hook (if WORKFLOW.md provides)
+        if repo_cfg.get("install"):
+            try:
+                run(repo_cfg["install"], cwd=ws_dir, timeout=600, check=True)
+            except Exception as e:
+                comment(f"🦉 ⚠️ Install step failed: {str(e)[:200]}\nContinuing — agent may still be able to make changes.")
+
+        # 8. Build prompt + invoke claude-code
+        prompt = build_prompt(issue, workflow_prompt, repo)
+
+        # claude-code-opus45 wrapper accepts a prompt via stdin in --print mode.
+        # Tools limited to what code work needs.
+        claude_cmd = [
+            CLAUDE,
+            "--print",
+            "--allowedTools", "Read,Edit,Write,Bash,Glob,Grep,WebFetch",
+        ]
+        print(f"$ (piping prompt) {' '.join(claude_cmd)}", flush=True)
+        try:
+            proc = subprocess.run(
+                claude_cmd,
+                input=prompt,
+                cwd=str(ws_dir),
+                capture_output=True,
+                text=True,
+                timeout=hard_timeout,
+            )
+            if proc.stdout:
+                print(proc.stdout, flush=True)
+            if proc.stderr:
+                print(proc.stderr, file=sys.stderr, flush=True)
+            if proc.returncode != 0:
+                raise RuntimeError(f"claude-code failed (rc={proc.returncode})")
+        except subprocess.TimeoutExpired:
+            comment(f"🦉 ❌ Hit hard timeout ({hard_timeout}s). Workspace preserved at `{ws_dir}`.")
+            transition("failed")
+            cleanup()
+            return 1
+
+        # 9. Verify changes were made
+        diff_check = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(ws_dir), capture_output=True, text=True,
+        )
+        if not diff_check.stdout.strip():
+            # Some agents commit themselves; if the branch already has a new
+            # commit relative to default branch we still consider it work done.
+            log_check = subprocess.run(
+                ["git", "log", "--oneline", "main..HEAD"],
+                cwd=str(ws_dir), capture_output=True, text=True,
+            )
+            if not log_check.stdout.strip():
+                comment("🦉 ❌ Agent ran but produced no changes. Workspace preserved for inspection.")
+                transition("failed")
+                cleanup()
+                return 1
+
+        # 10. Stage + commit any uncommitted changes
+        if diff_check.stdout.strip():
+            run(["git", "add", "-A"], cwd=ws_dir)
+            run([
+                "git",
+                "-c", "user.name=NightOwl",
+                "-c", "user.email=ishans-assistant@users.noreply.github.com",
+                "commit", "-m", f"{issue_key}: {issue['title']}",
+            ], cwd=ws_dir)
+
+        # 11. Run tests / lint / build per WORKFLOW.md
+        test_status = run_quality_gates(ws_dir, repo_cfg)
+
+        # 12. Push branch
+        try:
+            run(["git", "push", "-u", "origin", branch], cwd=ws_dir, timeout=120)
+        except Exception as e:
+            comment(f"🦉 ❌ Push failed: {str(e)[:200]}")
+            transition("failed")
+            cleanup()
+            return 1
+
+        # 13. Open PR
+        pr_body = build_pr_body(issue, branch, test_status)
+        draft = test_status.get("any_failed") and pr_cfg.get("draft_on_test_failure", True)
+        pr_cmd = ["gh", "pr", "create", "--repo", repo,
+                  "--base", repo_cfg.get("default_branch", "main"),
+                  "--head", branch,
+                  "--title", f"{issue_key}: {issue['title']}",
+                  "--body", pr_body]
+        if draft:
+            pr_cmd.append("--draft")
+        for reviewer in pr_cfg.get("reviewers") or []:
+            pr_cmd.extend(["--reviewer", reviewer])
+
+        pr_proc = subprocess.run(pr_cmd, cwd=str(ws_dir), capture_output=True, text=True, timeout=60)
+        if pr_proc.returncode != 0:
+            comment(f"🦉 ❌ PR open failed: {pr_proc.stderr.strip()[:300]}")
+            transition("failed")
+            cleanup()
+            return 1
+        pr_url = pr_proc.stdout.strip().splitlines()[-1]
+
+        # 14. Final status comment + transition
+        gates_summary = format_gates(test_status)
+        if test_status.get("any_failed"):
+            comment(f"🦉 ⚠️ PR opened as DRAFT: {pr_url}\n{gates_summary}\n⏳ Awaiting review")
+        else:
+            comment(f"🦉 ✅ PR opened: {pr_url}\n{gates_summary}\n⏳ Awaiting review")
+        transition("done")
+
+        cleanup()
+        # Successful — clean workspace
+        shutil.rmtree(ws_dir, ignore_errors=True)
+        return 0
+
+    except Exception as e:
+        comment(f"🦉 ❌ Failed: {str(e)[:300]}")
+        transition("failed")
+        cleanup()
+        return 1
+
+
+def build_prompt(issue: dict, workflow_prompt: str, repo: str) -> str:
+    parts = []
+    if workflow_prompt:
+        parts.append(workflow_prompt)
+        parts.append("")
+    parts.append(f"## Ticket {issue['key']}: {issue['title']}")
+    parts.append("")
+    if issue.get("body"):
+        parts.append(issue["body"])
+        parts.append("")
+    parts.append("## Your task")
+    parts.append(f"Implement the changes needed to satisfy this ticket in repo `{repo}`. ")
+    parts.append("Make minimal, focused changes. Match existing patterns. ")
+    parts.append("If the ticket is ambiguous, make a small reasonable interpretation and document the assumption in the PR description rather than asking. ")
+    parts.append("Do NOT commit or push — outer machinery handles git operations.")
+    return "\n".join(parts)
+
+
+def run_quality_gates(ws_dir: Path, repo_cfg: dict) -> dict:
+    """Run install/test/lint/build per WORKFLOW.md. Returns status summary."""
+    summary = {"test": "skipped", "lint": "skipped", "build": "skipped", "any_failed": False}
+    for gate in ("test", "lint", "build"):
+        cmd = repo_cfg.get(gate)
+        if not cmd:
+            continue
+        try:
+            run(cmd, cwd=ws_dir, timeout=600, check=True)
+            summary[gate] = "pass"
+        except Exception as e:
+            summary[gate] = "fail"
+            summary["any_failed"] = True
+            summary[f"{gate}_error"] = str(e)[:200]
+    return summary
+
+
+def format_gates(status: dict) -> str:
+    lines = []
+    for g in ("test", "lint", "build"):
+        s = status.get(g, "skipped")
+        emoji = {"pass": "✅", "fail": "❌", "skipped": "—"}[s]
+        lines.append(f"{emoji} {g}: {s}")
+    return "\n".join(lines)
+
+
+def build_pr_body(issue: dict, branch: str, test_status: dict) -> str:
+    return (
+        f"{issue.get('title','')}\n\n"
+        f"Closes {issue['key']}\n\n"
+        f"---\n\n"
+        f"🦉 Generated by NightOwl from ticket [{issue['key']}]({issue.get('url','')}).\n\n"
+        f"**Quality gates:**\n{format_gates(test_status)}\n\n"
+        f"Branch: `{branch}`"
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())
