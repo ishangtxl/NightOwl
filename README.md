@@ -1,33 +1,42 @@
 # NightOwl
 
-> An autonomous off-hours developer agent built on [OpenClaw](https://openclaw.ai). Talk to it on Telegram — text or voice — or just drag a Linear / GitHub ticket into Todo and walk away. Either way, you arrive home to a finished PR.
+> An autonomous off-hours developer agent built on [OpenClaw](https://openclaw.ai). Talk to it on Telegram — text or voice — or just label a Linear ticket `nightowl` and walk away. Either way, you arrive home to a finished pull request.
 
 **OpenClaw Hackathon submission — Theme 3: Productivity Platforms.**
+
+---
 
 ## The idea
 
 Even with AI coding assistants, real engineering work still stops when you step away from the keyboard. Compile times, code reviews, deploys, and night-time incidents all sit in the queue until a human is back at a desk.
 
-NightOwl gives you two ways to delegate. **On the go**, send it a Telegram message — *"add a dark-mode toggle to the settings page"* — or a voice note. **At work**, label a Linear ticket `nightowl` (or assign a GitHub issue to it) and forget about it. Either path runs the same skill library underneath: plan, write the code, run tests, push from its own GitHub account, open a PR, and post the URL back to the ticket or chat.
+NightOwl gives you two ways to delegate, both running the same skill library underneath.
+
+**On the go** — send NightOwl a Telegram message or voice note. *"Add a `/api/version` endpoint to DyslexiAid that returns the package version."* It plans the work, writes the code, runs quality gates, opens a pull request from its own GitHub identity, and replies on Telegram with the URL.
+
+**During work hours** — drag a Linear ticket into Todo, label it `nightowl`, and forget about it. Within 30 seconds NightOwl claims the ticket, posts a status comment, and starts working. A few minutes later there's a PR linked back to the ticket, with quality-gate output and a link to the Vercel preview.
 
 By the time you next look at GitHub, the PR is already there waiting for review.
 
 ```
-You (Telegram):
-  add a "Built by NightOwl 🦉" footer to index.html in
-  Ishans-assistant/nightowl-demo
+You (Linear):
+  Drag ticket "ISH-12: Add password reset endpoint" into Todo, label `nightowl`
 
-NightOwl:
-  On it. Cloning Ishans-assistant/nightowl-demo, will report back with PR.
+NightOwl (~5 sec):
+  🦉 Claimed by NightOwl. Cloning ishangtxl/<repo>...
 
-NightOwl (~30s later):
-  ✅ Added Built by NightOwl 🦉 footer.
-  📦 https://github.com/Ishans-assistant/nightowl-demo/pull/1
-  🧪 tests: static HTML check passed; no automated suite present
-  ⏳ awaiting your review, no auto-merge
+NightOwl (~10 sec):
+  🦉 Implementing on branch ish-12-add-password-reset-endpoint — ETA ~2-4 min.
+
+NightOwl (~3 min):
+  🦉 ✅ PR opened: https://github.com/.../pull/47
+  ✅ build: pass — lint: skipped — test: skipped
+  ⏳ Awaiting review
 ```
 
-That exchange is verbatim from the first end-to-end run.
+The same loop runs from Telegram, with the bot's response landing in your DM instead of the ticket.
+
+---
 
 ## Why it's OpenClaw-native
 
@@ -42,69 +51,80 @@ The interesting design choice is what NightOwl doesn't build. OpenClaw already p
 | Approvals for risky ops | OpenClaw `exec-approvals` |
 | Code generation | Standalone `claude` CLI (`claude-opus-4-5`) via the existing `claude-code-opus45` wrapper |
 | Repo operations | `gh` CLI authenticated as a dedicated bot account |
-| **NightOwl's contribution** | One persona (IDENTITY/SOUL/USER/AGENTS/TOOLS) + three orchestration skills |
+| **NightOwl's contribution** | One persona (IDENTITY/SOUL/USER/AGENTS/TOOLS), four orchestration skills, two BoardAdapters, a per-issue runner, and a systemd-driven watcher loop |
 
-The whole submission is roughly 800 lines of markdown — three skill files and the agent's identity. Everything else is composition. That's the point: OpenClaw makes "an autonomous developer colleague" a configuration, not a project.
+NightOwl's contribution lives in plain-text markdown and small Python scripts — no compiled artifacts, no daemons of its own. Drop the agent files into a fresh OpenClaw VPS, install the systemd timer, and you have an autonomous engineer that never gets tired.
 
 See [`docs/architecture.md`](docs/architecture.md) for the full diagram and rationale.
 
+---
+
 ## What it does today
 
-Two input channels, one shared skill library.
-
-**Telegram** (text or voice — for delegating on the go):
+### Telegram — for delegating on the go
 
 | Intent | Skill | What happens |
 |---|---|---|
-| Implement / fix / change | [`nightowl-feature-flow`](skills/nightowl-feature-flow/SKILL.md) | Clones the target repo, branches, edits (delegating non-trivial code to Claude Code), runs tests, pushes, opens a PR, replies with the URL |
+| Implement / fix / change | [`nightowl-feature-flow`](skills/nightowl-feature-flow/SKILL.md) | Clones the target repo, branches, edits (delegating non-trivial code to Claude Code), runs quality gates, pushes, opens a PR, replies with the URL |
 | Review a PR | [`nightowl-pr-review`](skills/nightowl-pr-review/SKILL.md) | Checks out the PR in a sandbox, asks Claude Code for a structured review, posts line comments and a verdict |
-| Security audit | [`nightowl-security-review`](skills/nightowl-security-review/SKILL.md) | Scans the repo or PR for the OWASP-style top categories, posts findings as a GitHub issue or PR comment |
+| Security audit | [`nightowl-security-review`](skills/nightowl-security-review/SKILL.md) | Scans the repo or PR for OWASP-style top categories, posts findings as a GitHub issue or PR comment |
 
-**Board watcher** (Linear + GitHub Issues — for delegating during work hours):
+### Board watcher — for delegating during work hours
 
-A systemd timer fires NightOwl's [board watcher](docs/board-watcher-design.md) every 30 seconds. It polls every configured tracker for tickets labelled `nightowl` (or assigned to the bot on GitHub) and ships them as PRs autonomously, up to a configurable concurrency cap. Each repo controls behaviour through a [`WORKFLOW.md`](docs/workflow-md.md) at its root — install/test/lint/build commands, deploy provider, PR settings, prompt template. The watcher posts `🦉 Implementing…` and `🦉 ✅ PR opened: …` updates back to the ticket as it works.
+A systemd timer fires `bin/nightowl-board-watcher` every 30 seconds. It polls each configured tracker (Linear, GitHub Issues — pluggable via the [`BoardAdapter` protocol](docs/board-watcher-design.md#42-boardadapter-interface)) for tickets that match the eligibility filter (label `nightowl`, or assigned to the bot on GitHub) and dispatches up to `max_concurrent_runs` per-issue runners in parallel. Each runner clones the repo, branches as `<ticket-key>-<slug>`, runs Claude Code per the target repo's [`WORKFLOW.md`](docs/workflow-md.md), executes quality gates, pushes, opens a PR with `Closes <ticket-key>`, and posts the URL back to the ticket.
 
-```
-You (Linear):  drag ticket "Add password reset endpoint" into Todo, label `nightowl`
-NightOwl:      🦉 Claimed by NightOwl. Cloning ishangtxl/<repo>...
-NightOwl:      🦉 Implementing on branch ish-12-add-password-reset-endpoint — ETA ~2-4 min.
-NightOwl:      🦉 ✅ PR opened: https://github.com/.../pull/47
-                ✅ build: pass — lint: skipped — test: skipped
-                ⏳ Awaiting review
-```
+The eligibility filter is intentionally narrow: tickets must be explicitly opted-in via label, so NightOwl never picks up your entire backlog by accident. Bounded global concurrency, label-based claim/release, and lock files keep the loop safe even across daemon restarts.
 
-That sequence is verbatim from the smoke test (a slightly less ambitious ticket, but the same flow end-to-end).
+### Safety properties
 
-All skills are read-mostly. NightOwl never merges, force-pushes, or deploys to production without explicit human approval routed through OpenClaw's exec-approvals.
+All skills are read-mostly. NightOwl never merges, force-pushes, or deploys to production without explicit human approval routed through OpenClaw's exec-approvals. PRs that fail their quality gates are opened as drafts with the test output in the description, so a failed run never silently retries — it asks a human.
+
+---
 
 ## Repo layout
 
 ```
 agents/nightowl/        Agent persona — IDENTITY, SOUL, USER, AGENTS, TOOLS, HEARTBEAT, MEMORY
                         + board-watcher.config.yaml listing managed trackers
-skills/                 Per-skill markdown — synced to the agent's per-workspace skills/
-bin/                    Shell scripts run by the watcher, not the agent:
-  nightowl-board-watcher  systemd-fired tick — finds eligible issues
+skills/                 Per-skill markdown synced to the agent's per-workspace skills/
+bin/                    Runtime executables (not invoked by the agent — invoked by cron):
+  nightowl-board-watcher  systemd-fired tick — finds eligible issues, dispatches runners
   nightowl-issue-runner   per-issue executor — clone, branch, claude, push, PR
   adapters/{linear,github-issues}  pluggable BoardAdapter implementations
 examples/WORKFLOW.md    Annotated example for adopting NightOwl in your own repo
 scripts/sync-to-vps.sh  Idempotent rsync from this repo to the VPS workspace
-docs/                   Architecture, setup guide, board-watcher design, demo script
+docs/                   Architecture, setup, board-watcher design, demo, test plan
 ```
 
-## Trying it yourself
+---
+
+## For evaluators
+
+If you want to verify this works without setting up your own VPS, see [`docs/test-plan.md`](docs/test-plan.md). It covers the comprehensive end-to-end test the author runs before each demo — every input channel, every skill, with concrete expected outputs. The submission was developed against this test, and the repo references real Linear tickets (ISH-5, ISH-6) and DyslexiAid PRs that you can inspect on GitHub for proof-of-life:
+
+- DyslexiAid PR #1 — first autonomous PR from a Linear ticket: https://github.com/ishangtxl/DyslexiAid/pull/1
+- DyslexiAid PR #2 — second autonomous PR (concurrent run, same tick): https://github.com/ishangtxl/DyslexiAid/pull/2
+- DyslexiAid PR #3 — `WORKFLOW.md` adopted by the demo target itself
+- DyslexiAid PR #4 — CI workflow added to gate NightOwl PRs
+
+The Linear board (`ishans-demo` workspace, team key `ISH`) is private but each ticket's audit trail is preserved in the comment thread of the corresponding PR.
+
+For a 3-minute walkthrough see [`docs/demo-script.md`](docs/demo-script.md).
+
+---
+
+## Reproducing locally
 
 Full provisioning steps in [`docs/setup.md`](docs/setup.md). The short version:
 
-1. **VPS prerequisites:** OpenClaw 2026.5+, `claude` Code CLI logged in, `gh` CLI installed.
+1. **VPS prerequisites** — OpenClaw 2026.5+, `claude` Code CLI logged in, `gh` CLI installed.
 2. **Create a dedicated GitHub account** for the bot (NightOwl uses `@Ishans-assistant`). Authenticate `gh` as that account on the VPS.
 3. **Create a dedicated Telegram bot** via [@BotFather](https://t.me/BotFather). NightOwl needs its own bot — sharing one with another OpenClaw agent will collide on routing.
 4. **Add the agent and bind the bot:**
    ```bash
    openclaw agents add nightowl \
      --workspace /root/.openclaw/workspace/nightowl \
-     --model microsoft-foundry/gpt-5.5 \
-     --non-interactive
+     --model microsoft-foundry/gpt-5.5 --non-interactive
 
    openclaw channels add --channel telegram --account nightowl \
      --token "<your-bot-token>" --name "NightOwl"
@@ -112,37 +132,46 @@ Full provisioning steps in [`docs/setup.md`](docs/setup.md). The short version:
    openclaw agents bind --agent nightowl --bind telegram:nightowl
    openclaw daemon restart
    ```
-5. **Sync the persona and skills from this repo:**
+5. **Sync the persona, skills, and bin scripts:**
    ```bash
    ./scripts/sync-to-vps.sh
    ```
-6. **DM the bot on Telegram.** See [`docs/demo-script.md`](docs/demo-script.md) for the smoke test sequence.
+6. **DM the bot on Telegram** — that's the Telegram path, ready to use.
+7. **(Optional) Enable the board watcher** — see [`docs/setup.md`](docs/setup.md#optional-enable-the-board-watcher) for the systemd timer + Linear API key + per-repo `WORKFLOW.md` setup.
+
+---
 
 ## Status
 
-Phase 2 MVP — Telegram (2026-05-07):
+**Verified end-to-end:**
 
-- [x] `nightowl` agent isolated with its own workspace, identity, and routing
-- [x] Dedicated Telegram bot, owner-allowlisted
-- [x] Feature-flow skill verified end-to-end on a live demo repo
-- [x] Reviews and security passes wired and ready
-- [ ] Voice input verified end-to-end (the wrapper exists, just needs a voice-note flow test)
+- [x] Telegram `nightowl-feature-flow` — text input, real PR opened against a real repo
+- [x] Linear board watcher loop — ticket → claim → implement → push → PR → comment back, with autonomous concurrency cap
+- [x] GitHub Issues `BoardAdapter` — list verified; write paths use the same shared lifecycle-label vocabulary as Linear
+- [x] systemd-driven 30-second polling on the VPS
+- [x] Quality gates honoured per-repo (`WORKFLOW.md`)
+- [x] CI workflow added to demo target so NightOwl PRs get a green check before review
 
-Phase 2.5 — Board watcher (2026-05-08):
+**Wired but not exercised end-to-end on demo day yet:**
 
-- [x] Pluggable `BoardAdapter` protocol with Linear + GitHub Issues adapters
-- [x] Per-repo `WORKFLOW.md` schema for install/test/lint/build/deploy config
-- [x] Per-issue runner: clone → branch → Claude Code → push → PR → comment back
-- [x] Bounded concurrency (cap 2 by default), tick lock, label-based claim/release, restart recovery
-- [x] systemd timer driving 30-second polling on the VPS
-- [x] Verified end-to-end: two parallel Linear tickets shipped as two PRs autonomously
+- [ ] Telegram voice input (transcribe wrapper exists; needs a live voice-note flow test)
+- [ ] `nightowl-pr-review` end-to-end via Telegram
+- [ ] `nightowl-security-review` end-to-end via Telegram
 
-Phase 3 — Multi-agent orchestration + deploy (planned):
+These are covered in the test plan and will be exercised before the demo recording.
 
-- `nightowl-orchestrate` skill — replaces the single-Claude-Code call inside the per-issue runner with parallel role-specialists (🎨 Designer, 🛠 Backend, 🧪 QA, 🚀 Deploy). Each posts its own update back to the ticket.
-- `nightowl-deploy` — Vercel preview on every PR; production deploys behind exec-approval.
-- `nightowl-monitor` — post-deploy auto-rollback on Sentry / Vercel error rate spikes.
-- Demo video.
+---
+
+## Roadmap beyond submission
+
+These are intentionally out of scope for the submission — the loop above is what's built and verified. Listed here for completeness:
+
+- **Multi-agent orchestration** — replace the single Claude Code call inside the per-issue runner with parallel role-specialists (Designer / Backend / QA), each posting its own update to the ticket.
+- **`nightowl-deploy`** — Vercel preview on every PR; production deploys gated on Telegram approval.
+- **`nightowl-monitor`** — post-deploy auto-rollback on Sentry / Vercel error rate spikes.
+- **WhatsApp adapter** — second messaging channel via Baileys.
+
+---
 
 ## License
 
