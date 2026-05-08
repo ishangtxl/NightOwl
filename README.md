@@ -4,6 +4,22 @@
 
 **OpenClaw Hackathon submission — Theme 3: Productivity Platforms.**
 
+### Submission resources
+
+[![AI Disclosure Form](https://img.shields.io/badge/AI%20Disclosure-Form-4285F4?style=for-the-badge&logo=googledocs&logoColor=white)](https://docs.google.com/document/d/1TOJy2BL4o6APzJ_YPuyncC6cgCWzkDWr/edit?usp=sharing&ouid=106718376731510837435&rtpof=true&sd=true)
+[![Slide Deck](https://img.shields.io/badge/Slide%20Deck-PPT-F4B400?style=for-the-badge&logo=googleslides&logoColor=white)](https://docs.google.com/presentation/d/1NUgO9uQ_6m3EOnw9IVcJESvfnRheI7HY/edit?usp=sharing&ouid=106718376731510837435&rtpof=true&sd=true)
+[![Demo Video](https://img.shields.io/badge/Demo-Video-EA4335?style=for-the-badge&logo=googledrive&logoColor=white)](https://drive.google.com/drive/folders/1USl1UKlcpfyrZLTm7_T97nZnjTFuVPWP?usp=sharing)
+
+### Built with
+
+[![OpenClaw](https://img.shields.io/badge/OpenClaw-Platform-0EA5E9?style=for-the-badge&logoColor=white)](https://openclaw.ai)
+![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Linear](https://img.shields.io/badge/Linear-5E6AD2?style=for-the-badge&logo=linear&logoColor=white)
+![Telegram](https://img.shields.io/badge/Telegram-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)
+![GitHub](https://img.shields.io/badge/GitHub-181717?style=for-the-badge&logo=github&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
+![Bash](https://img.shields.io/badge/Bash-4EAA25?style=for-the-badge&logo=gnubash&logoColor=white)
+
 ---
 
 ## Problem
