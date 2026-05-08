@@ -6,9 +6,13 @@
 
 ---
 
-## The idea
+## Problem
 
-Even with AI coding assistants, real engineering work still stops when you step away from the keyboard. Compile times, code reviews, deploys, and night-time incidents all sit in the queue until a human is back at a desk.
+Even with AI coding assistants, real engineering work still stops when you step away from the keyboard. Compile times, code reviews, deploys, and night-time incidents all sit in the queue until a human is back at a desk. AI coding tools amplify what you can do *while sitting at the laptop*; they don't extend your reach beyond it.
+
+The gap is a lack of *delegation surface*. There's no easy way to hand a small task to an autonomous agent and trust that, by the time you're back, the work is done in a form you can review — a pull request, with tests run and a link back to wherever the task originated.
+
+## Solution
 
 NightOwl gives you two ways to delegate, both running the same skill library underneath.
 
@@ -109,7 +113,9 @@ If you want to verify this works without setting up your own VPS, see [`docs/tes
 
 The Linear board (`ishans-demo` workspace, team key `ISH`) is private but each ticket's audit trail is preserved in the comment thread of the corresponding PR.
 
-For a 3-minute walkthrough see [`docs/demo-script.md`](docs/demo-script.md).
+For a 4–5 minute walkthrough see [`docs/demo-script.md`](docs/demo-script.md). For the AI-tool disclosure required by the hackathon rules see [`AI_DISCLOSURE.md`](AI_DISCLOSURE.md).
+
+**No APK / SDK is shipped.** NightOwl is a server-side product (Python + bash, running on a VPS) plus a Telegram bot. There's nothing to install on a phone — Telegram itself is the only client-side surface, and that's a pre-existing app the user already has.
 
 ---
 
