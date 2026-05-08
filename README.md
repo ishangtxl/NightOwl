@@ -75,7 +75,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full diagram and rati
 
 ### Board watcher — for delegating during work hours
 
-A systemd timer fires `bin/nightowl-board-watcher` every 30 seconds. It polls each configured tracker (Linear, GitHub Issues — pluggable via the `BoardAdapter` protocol) for tickets that match the eligibility filter (label `nightowl`, or assigned to the bot on GitHub) and dispatches up to `max_concurrent_runs` per-issue runners in parallel. Each runner clones the repo, branches as `<ticket-key>-<slug>`, runs Claude Code per the target repo's [`WORKFLOW.md`](docs/workflow-md.md), executes quality gates, pushes, opens a PR with `Closes <ticket-key>`, and posts the URL back to the ticket.
+A systemd timer fires `bin/nightowl-board-watcher` every 30 seconds. It polls each configured tracker (Linear, GitHub Issues — pluggable via the [`BoardAdapter` protocol](docs/board-watcher-design.md#42-boardadapter-interface)) for tickets that match the eligibility filter (label `nightowl`, or assigned to the bot on GitHub) and dispatches up to `max_concurrent_runs` per-issue runners in parallel. Each runner clones the repo, branches as `<ticket-key>-<slug>`, runs Claude Code per the target repo's [`WORKFLOW.md`](docs/workflow-md.md), executes quality gates, pushes, opens a PR with `Closes <ticket-key>`, and posts the URL back to the ticket.
 
 The eligibility filter is intentionally narrow: tickets must be explicitly opted-in via label, so NightOwl never picks up your entire backlog by accident. Bounded global concurrency, label-based claim/release, and lock files keep the loop safe even across daemon restarts.
 
