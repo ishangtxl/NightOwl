@@ -75,7 +75,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full diagram and rati
 
 ### Board watcher — for delegating during work hours
 
-A systemd timer fires `bin/nightowl-board-watcher` every 30 seconds. It polls each configured tracker (Linear, GitHub Issues — pluggable via the [`BoardAdapter` protocol](docs/board-watcher-design.md#42-boardadapter-interface)) for tickets that match the eligibility filter (label `nightowl`, or assigned to the bot on GitHub) and dispatches up to `max_concurrent_runs` per-issue runners in parallel. Each runner clones the repo, branches as `<ticket-key>-<slug>`, runs Claude Code per the target repo's [`WORKFLOW.md`](docs/workflow-md.md), executes quality gates, pushes, opens a PR with `Closes <ticket-key>`, and posts the URL back to the ticket.
+A systemd timer fires `bin/nightowl-board-watcher` every 30 seconds. It polls each configured tracker (Linear, GitHub Issues — pluggable via the `BoardAdapter` protocol) for tickets that match the eligibility filter (label `nightowl`, or assigned to the bot on GitHub) and dispatches up to `max_concurrent_runs` per-issue runners in parallel. Each runner clones the repo, branches as `<ticket-key>-<slug>`, runs Claude Code per the target repo's [`WORKFLOW.md`](docs/workflow-md.md), executes quality gates, pushes, opens a PR with `Closes <ticket-key>`, and posts the URL back to the ticket.
 
 The eligibility filter is intentionally narrow: tickets must be explicitly opted-in via label, so NightOwl never picks up your entire backlog by accident. Bounded global concurrency, label-based claim/release, and lock files keep the loop safe even across daemon restarts.
 
@@ -97,25 +97,8 @@ bin/                    Runtime executables (not invoked by the agent — invoke
   adapters/{linear,github-issues}  pluggable BoardAdapter implementations
 examples/WORKFLOW.md    Annotated example for adopting NightOwl in your own repo
 scripts/sync-to-vps.sh  Idempotent rsync from this repo to the VPS workspace
-docs/                   Architecture, setup, board-watcher design, demo, test plan
+docs/                   Architecture, setup, board-watcher design
 ```
-
----
-
-## For evaluators
-
-If you want to verify this works without setting up your own VPS, see [`docs/test-plan.md`](docs/test-plan.md). It covers the comprehensive end-to-end test the author runs before each demo — every input channel, every skill, with concrete expected outputs. The submission was developed against this test, and the repo references real Linear tickets (ISH-5, ISH-6) and DyslexiAid PRs that you can inspect on GitHub for proof-of-life:
-
-- DyslexiAid PR #1 — first autonomous PR from a Linear ticket: https://github.com/ishangtxl/DyslexiAid/pull/1
-- DyslexiAid PR #2 — second autonomous PR (concurrent run, same tick): https://github.com/ishangtxl/DyslexiAid/pull/2
-- DyslexiAid PR #3 — `WORKFLOW.md` adopted by the demo target itself
-- DyslexiAid PR #4 — CI workflow added to gate NightOwl PRs
-
-The Linear board (`ishans-demo` workspace, team key `ISH`) is private but each ticket's audit trail is preserved in the comment thread of the corresponding PR.
-
-For a 4–5 minute walkthrough see [`docs/demo-script.md`](docs/demo-script.md). The AI Usage Disclosure Form required by the hackathon rules is here: [AI Usage Disclosure Form](https://docs.google.com/document/d/1TOJy2BL4o6APzJ_YPuyncC6cgCWzkDWr/edit?usp=sharing&ouid=106718376731510837435&rtpof=true&sd=true).
-
-**No APK / SDK is shipped.** NightOwl is a server-side product (Python + bash, running on a VPS) plus a Telegram bot. There's nothing to install on a phone — Telegram itself is the only client-side surface, and that's a pre-existing app the user already has.
 
 ---
 

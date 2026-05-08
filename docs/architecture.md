@@ -97,8 +97,6 @@ There are two input paths into the same skill library. The Telegram path is inte
 
 The orchestrator is a single Python script that runs on every cron tick, holds a global tick lock so two ticks can't trample each other, queries each adapter, applies eligibility filters, and dispatches `bin/nightowl-issue-runner` in the background per issue. The runner does the per-issue work and writes its own log file under `~/.openclaw/workspace/nightowl/logs/`.
 
-For the full design rationale, claim/release semantics, restart recovery, and failure handling, see [`docs/board-watcher-design.md`](board-watcher-design.md).
-
 ## Why two model layers
 
 | Role | Model | Why |
