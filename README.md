@@ -113,7 +113,7 @@ If you want to verify this works without setting up your own VPS, see [`docs/tes
 
 The Linear board (`ishans-demo` workspace, team key `ISH`) is private but each ticket's audit trail is preserved in the comment thread of the corresponding PR.
 
-For a 4–5 minute walkthrough see [`docs/demo-script.md`](docs/demo-script.md). For the AI-tool disclosure required by the hackathon rules see [`AI_DISCLOSURE.md`](AI_DISCLOSURE.md).
+For a 4–5 minute walkthrough see [`docs/demo-script.md`](docs/demo-script.md). The AI Usage Disclosure Form required by the hackathon rules is here: [AI Usage Disclosure Form](https://docs.google.com/document/d/1TOJy2BL4o6APzJ_YPuyncC6cgCWzkDWr/edit?usp=sharing&ouid=106718376731510837435&rtpof=true&sd=true).
 
 **No APK / SDK is shipped.** NightOwl is a server-side product (Python + bash, running on a VPS) plus a Telegram bot. There's nothing to install on a phone — Telegram itself is the only client-side surface, and that's a pre-existing app the user already has.
 
